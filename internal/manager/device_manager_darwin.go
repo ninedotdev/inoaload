@@ -26,6 +26,22 @@ const (
 
 var usbmux gidevice.Usbmux
 
+// wirelessSeen smooths over the per-scan flicker of Bonjour announcements:
+// iOS devices in Wi-Fi power-save reply intermittently, so a 2 s browse will
+// often miss them even though they're still on the LAN. We remember anything
+// observed in the last wirelessSeenTTL and re-emit it on subsequent scans.
+const wirelessSeenTTL = 30 * time.Second
+
+var (
+	wirelessSeenMu sync.Mutex
+	wirelessSeen   = map[string]wirelessSeenEntry{}
+)
+
+type wirelessSeenEntry struct {
+	device   model.Device
+	lastSeen time.Time
+}
+
 func (dm *DeviceManager) Start() {
 	dm.mu.Lock()
 	dm.ctx, dm.cancel = context.WithCancel(context.Background())
@@ -213,8 +229,47 @@ func (dm *DeviceManager) ScanWirelessDevices(ctx context.Context, timeout time.D
 	wg.Wait()
 
 	result := dedupeDevices(devices)
+	result = mergeWirelessSeen(result)
 	applyPairedRegistry(result)
 	return result, nil
+}
+
+// mergeWirelessSeen records every device from the current scan and re-injects
+// any cached device whose lastSeen is still within wirelessSeenTTL. This stops
+// iPhones from disappearing on scans where their mDNS responder didn't reply
+// in time. Cached entries that are also in the new scan get refreshed (so
+// their freshly-observed IP wins).
+func mergeWirelessSeen(current []model.Device) []model.Device {
+	now := time.Now()
+	wirelessSeenMu.Lock()
+	defer wirelessSeenMu.Unlock()
+
+	keyOf := func(d model.Device) string {
+		if d.UDID != "" {
+			return "u:" + d.UDID
+		}
+		return "nc:" + strings.ToLower(d.Name) + "/" + strings.ToLower(d.DeviceClass)
+	}
+
+	currentKeys := map[string]bool{}
+	for _, d := range current {
+		k := keyOf(d)
+		currentKeys[k] = true
+		wirelessSeen[k] = wirelessSeenEntry{device: d, lastSeen: now}
+	}
+
+	out := append([]model.Device(nil), current...)
+	for k, e := range wirelessSeen {
+		if now.Sub(e.lastSeen) > wirelessSeenTTL {
+			delete(wirelessSeen, k)
+			continue
+		}
+		if currentKeys[k] {
+			continue
+		}
+		out = append(out, e.device)
+	}
+	return out
 }
 
 // applyPairedRegistry marks AppleTV devices as Paired when a prior successful
